@@ -1,0 +1,121 @@
+----------------------------------------------------------------------------
+--Поддерживать сырые логи событий (схема выше), хранятся 30 дней
+----------------------------------------------------------------------------
+CREATE TABLE user_events (
+    user_id UInt32,
+    event_type String,
+    points_spent UInt32,
+    event_time DateTime
+) ENGINE = MergeTree()
+ORDER BY (event_time, user_id)
+TTL event_time + INTERVAL 30 DAY;
+
+----------------------------------------------------------------------------
+--Построить агрегированную таблицу. Храним агрегаты 180 дней
+----------------------------------------------------------------------------
+CREATE TABLE user_daily_agg (
+    event_date DateTime,
+    event_type String,
+    uniq_users_state AggregateFunction(uniq, UInt32),
+    points_spent_state AggregateFunction(sum, UInt32),
+    action_count_state AggregateFunction(count, UInt8)
+) ENGINE = AggregatingMergeTree()
+ORDER BY (event_date, event_type) 
+TTL event_date + INTERVAL 180 DAY;
+
+----------------------------------------------------------------------------
+--Сделать Materialized View
+----------------------------------------------------------------------------
+CREATE MATERIALIZED VIEW mv_user_daily_agg
+TO user_daily_agg
+AS
+SELECT 
+    toDate(event_time) AS event_date,
+    event_type,
+    uniqState(user_id) AS uniq_users_state,
+    sumState(points_spent) AS points_spent_state,
+    countState() AS action_count_state
+FROM user_events
+GROUP BY event_date, event_type; 
+
+----------------------------------------------------------------------------
+--Выполнить запрос для вставки тестовых данных
+----------------------------------------------------------------------------
+INSERT INTO user_events VALUES
+(1, 'login', 0, now() - INTERVAL 10 DAY),
+(2, 'signup', 0, now() - INTERVAL 10 DAY),
+(3, 'login', 0, now() - INTERVAL 10 DAY),
+(1, 'login', 0, now() - INTERVAL 7 DAY),
+(2, 'login', 0, now() - INTERVAL 7 DAY),
+(3, 'purchase', 30, now() - INTERVAL 7 DAY),
+(1, 'purchase', 50, now() - INTERVAL 5 DAY),
+(2, 'logout', 0, now() - INTERVAL 5 DAY),
+(4, 'login', 0, now() - INTERVAL 5 DAY),
+(1, 'login', 0, now() - INTERVAL 3 DAY),
+(3, 'purchase', 70, now() - INTERVAL 3 DAY),
+(5, 'signup', 0, now() - INTERVAL 3 DAY),
+(2, 'purchase', 20, now() - INTERVAL 1 DAY),
+(4, 'logout', 0, now() - INTERVAL 1 DAY),
+(5, 'login', 0, now() - INTERVAL 1 DAY),
+(1, 'purchase', 25, now()),
+(2, 'login', 0, now()),
+(3, 'logout', 0, now()),
+(6, 'signup', 0, now()),
+(6, 'purchase', 100, now());
+
+
+--Проверить заполнение таблицы user_events при необходимости
+SELECT * FROM `user_events` ue;
+
+--Проверить заполнение таблицы user_daily_agg при необходимости
+SELECT `event_date`, `event_type`, `uniq_users_state`,
+'points_spent_state', 'action_count_state'
+FROM `default`.`user_daily_agg`;
+
+----------------------------------------------------------------------------
+-- Создать запрос, показывающий: Retention
+-- (сколько пользователей вернулись в течение следующих 7 дней для каждой даты)
+-- т е считаем сумму пользователей за период 7 дней, а не в последний день.
+-- делим на количество активных пользователей на стартовую дату активности
+-- (считаем любую активность, а не только регистрацию)
+----------------------------------------------------------------------------   
+WITH 
+ UserActivity AS(
+SELECT 
+a.user_id,
+date(a.first_activity_date) AS first_activity_date,
+date_add(a.first_activity_date, INTERVAL 7 DAY) AS day_7
+FROM 
+(SELECT
+user_id,
+(event_time) first_activity_date
+FROM user_events
+GROUP BY 1, 2) a )
+SELECT
+	a.first_activity_date,
+	date(a.day_7),
+	count(DISTINCT(a.user_id)) total_users_day_0,
+	COUNT(DISTINCT
+	CASE 
+	WHEN (date(u.event_time)>date(a.first_activity_date) AND date(u.event_time) < date_add(a.first_activity_date, INTERVAL 7 DAY)) THEN a.user_id
+END) AS returned_in_7_days,
+	ROUND((returned_in_7_days / total_users_day_0 * 100), 2) AS retention_7d_percent
+FROM
+	UserActivity a
+LEFT JOIN user_events u ON
+	a.user_id = u.user_id
+GROUP BY 1, 2
+ORDER BY 2;
+
+----------------------------------------------------------------------------
+--Создать запрос с группировками по быстрой аналитике по дням
+----------------------------------------------------------------------------
+SELECT 
+    event_date,
+    event_type,
+    uniqMerge(uniq_users_state) AS unique_users,
+    sumMerge(points_spent_state) AS total_spent,
+    countMerge(action_count_state) AS total_actions
+FROM user_daily_agg
+GROUP BY event_date, event_type
+ORDER BY event_date;
